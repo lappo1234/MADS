@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import sys
 import os
+import json
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -12,23 +13,35 @@ from torch.distributions import Categorical
 from tensorboardX import SummaryWriter
 
 # ==========================================
-# 1. »·¾³¹ÒÔØÓëÄ£¿éµ¼Èë
+# 1. è·¯å¾„é”šå®šä¸å·¥ç¨‹æŒ‚è½½
 # ==========================================
 current_dir = os.path.dirname(os.path.abspath(__file__)) 
 root_dir = os.path.dirname(current_dir)
 if root_dir not in sys.path:
     sys.path.append(root_dir)
 
-# È·±£Â·¾¶Æ¥ÅäÄãµÄ¹¤³Ì½á¹¹
 from MADS_part.func import env_multi_robot
 from map.env import graphdict_setup
-from MADS_part.mads_network import MultiAgentManager # ÒıÈëÖ÷¿Ø Manager
+from MADS_part.mads_network import MultiAgentManager 
 
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+# æŒ‡å®šé¢„è®­ç»ƒ STGNN è·¯å¾„ (ä¸¥æ ¼å¯¹é½ä½ çš„ç›®å½•ç»“æ„)
+stgnn_ckpt_path = os.path.join(root_dir, "STGNN_part", "stgnn", "å¤šåœ°å›¾ç­–ç•¥", "2026-03-19_MultiMap_Curriculum_MSE_STGNN.pth")
 
-# ==============================================================================
-# 2. »ù´¡ÅäÖÃÓë MLOps ¹æ·¶ÃüÃû
-# ==============================================================================
+# ==========================================
+# 2. è®­ç»ƒè¶…å‚æ•°ä¸ MLOps å‘½åè§„åˆ™
+# ==========================================
+FIRST_MAP_STAY_LIMIT = 3000  
+MAIN_MAP_STAY_LIMIT = 1000   
+
+ROBOT_NUM = 5             
+STATE_SPACE = 130         
+SEQ_LEN = 30              
+GAMMA = 0.95
+STEP_LIMIT = 200          
+k = 1.0                     # å¼‚æ„æ¢ç´¢åº¦åˆå§‹æƒé‡ (åç»­åŠ¨æ€è°ƒæ•´)
+b = 0.5                     
+BETA = 1 # PG Loss å’Œ CE Loss çš„ç»„åˆæƒé‡ (å»ºè®®åæœŸå¯å¼•å…¥åŠ¨æ€é€€ç«)
+
 log_dir_base = "./maddpg"
 model_save_dir = "./mads_policy"
 os.makedirs(log_dir_base, exist_ok=True)
@@ -36,282 +49,255 @@ os.makedirs(model_save_dir, exist_ok=True)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# »·¾³Óë³¬²ÎÊı¶¨Òå
-episode_limit = 20000
-# [¼Ü¹¹Ê¦ĞŞÕı] ÉèÎª 'random' ÒÔÆ¥Åä env.py µÄÍ¼Éú³ÉÂß¼­£¬±ÜÃâ NameError
-env_name = "random" 
-robot_num = 4
-STATE_SPACE = 71 
-gamma = 0.95
-limit = 200     
-seq_len = 30
+# ==========================================
+# 3. åœ°å›¾åº“åŠ è½½ä¸ç‰©ç†éš¾åº¦æ’åº
+# ==========================================
+json_path = os.path.join(root_dir, 'map', 'top_100_edges.json')
+with open(json_path, 'r', encoding='utf-8') as f:
+    maps_dict = json.load(f)
 
-# ¶¯Ì¬ k ÖµÍË»ğ²ÎÊı
-k0 = 1          
-k_alpha = 0.5   
+full_map_curriculum = []
+for m_name, edges in maps_dict.items():
+    if not edges: continue
+    num_nodes = max([max(edge[0], edge[1]) for edge in edges]) + 1
+    full_map_curriculum.append((m_name, num_nodes))
 
-# ¶¯Ì¬Éú³É¸ß±æÊ¶¶ÈµÄ Run ID
+full_map_curriculum.sort(key=lambda x: x[1])
+map_curriculum = full_map_curriculum[-50:]
+MAP_COUNT = len(map_curriculum)
+
+EPISODE_LIMIT = FIRST_MAP_STAY_LIMIT + (MAP_COUNT - 1) * MAIN_MAP_STAY_LIMIT 
+
 current_time = datetime.now().strftime("%Y-%m-%d")
-run_name = f"{current_time}_{env_name}_{robot_num}agents"
+run_name = f"{current_time}_{ROBOT_NUM}agents_{EPISODE_LIMIT}episodes_GNN_Policy"
 
-# Ä£ĞÍ±£´æÓëÈÕÖ¾Â·¾¶
-SAVE_MODEL_PATH = os.path.join(model_save_dir, f"{run_name}.pkl")
-tb_log_dir = os.path.join(log_dir_base, run_name)
-
-CONTINUE_TRAINING = False  
-LOAD_MODEL_PATH = os.path.join(model_save_dir, "your_history_model_name.pkl") 
-
-# ==============================================================================
-# 3. ³õÊ¼»¯ÍøÂçÓëÍ¼½á¹¹
-# ==============================================================================
+# ==========================================
+# 4. æ¨¡å‹ä¸ä¼˜åŒ–å™¨åˆå§‹åŒ– (å¯¹é½ GNN æ¶æ„)
+# ==========================================
 manager = MultiAgentManager(
-    num_agents=robot_num,
-    stgnn_in_dim=2, # [¼Ü¹¹Ê¦¶ÏÑÔ] ±ØĞëÎª 2£º×ÔÉíÎ»ÖÃÌØÕ÷ + À×´ï¸ÅÂÊÌØÕ÷
+    num_agents=ROBOT_NUM,
+    stgnn_in_dim=2, 
     stgnn_out_dim=32,
     num_nodes=STATE_SPACE,
     hidden_dim=128,
-    seq_len=seq_len,
+    seq_len=SEQ_LEN,
+    freeze_stgnn=True,   # ğŸ›¡ï¸ STGNN å†»ç»“ä¿æŠ¤å¼€å¯
     device=device
 ).to(device)
 
-optimizer = optim.Adam(manager.parameters(), lr=0.001)
+optimizer = optim.Adam(filter(lambda p: p.requires_grad, manager.parameters()), lr=1e-4)
 
-start_episode = 0
-if CONTINUE_TRAINING and os.path.exists(LOAD_MODEL_PATH):
-    print(f"Loading history model from {LOAD_MODEL_PATH}...")
-    checkpoint = torch.load(LOAD_MODEL_PATH, map_location=device)
-    manager.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    start_episode = checkpoint['episode'] + 1
-    print(f"Resuming from episode {start_episode}")
+if os.path.exists(stgnn_ckpt_path):
+    ckpt = torch.load(stgnn_ckpt_path, map_location=device)
+    sd = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
+    manager.shared_stgnn.load_state_dict(sd, strict=False)
+    print(f"âœ… [Load] å·²æ³¨å…¥é¢„è®­ç»ƒ STGNN é›·è¾¾: {stgnn_ckpt_path}")
 else:
-    print("Starting training from scratch with RADAR Early-Fusion Head.")
+    print(f"âš ï¸ [Warning] æœªæ‰¾åˆ°æ¨¡å‹ {stgnn_ckpt_path}ï¼Œé›·è¾¾å°†éšæœºåˆå§‹åŒ–ï¼")
 
-writer = SummaryWriter(tb_log_dir)
-
-# ³õÊ¼»¯Í¼½á¹¹
-graph_ = graphdict_setup(env_name, STATE_SPACE)
-
-def build_edge_index(graph):
-    edges = [[u, v] for u in graph for v in graph[u]]
-    return torch.tensor(edges, dtype=torch.long).t().contiguous().to(device)
-
-edge_index = build_edge_index(graph_)
-
-# Ô¤äÖÈ¾È«¾Ö¶¯×÷ÑÚÂë
-global_adj_mask = torch.zeros((STATE_SPACE, STATE_SPACE), device=device)
-for i in range(STATE_SPACE):
-    if i in graph_:
-        global_adj_mask[i, graph_[i]] = 1.0
-
-def compute_dist_matrix(graph, N):
-    dist = np.full((N, N), np.inf)
-    for s in range(N):
-        dist[s][s] = 0
-        q = deque([s])
-        while q:
-            u = q.popleft()
-            for v in graph.get(u, []):
-                if dist[s][v] == np.inf:
-                    dist[s][v] = dist[s][u] + 1
-                    q.append(v)
-    return dist
-
-dist_matrix = compute_dist_matrix(graph_, STATE_SPACE)
-finite_dists = dist_matrix[np.isfinite(dist_matrix)]
-max_dist_val = int(np.nanmax(finite_dists)) if len(finite_dists) > 0 else 1
-
-# ==============================================================================
-# 4. ºËĞÄµ÷¶ÈÓëÌØÕ÷¼ÆËã
-# ==============================================================================
-def get_robot_idx(one_hot_obs):
-    return int(np.argmax(one_hot_obs))
-
-def build_node_feature_seq(history_poses):
-    poses_tensor = torch.tensor(list(history_poses), dtype=torch.long, device=device)
-    actual_len = poses_tensor.shape[0] 
+# ==========================================
+# 5. æ ¸å¿ƒåŠŸèƒ½å‡½æ•°
+# ==========================================
+def get_map_sequential_v2(current_ep, sorted_map_list):
+    if current_ep < FIRST_MAP_STAY_LIMIT:
+        idx = 0
+    else:
+        ep_in_main = current_ep - FIRST_MAP_STAY_LIMIT
+        idx = 1 + (ep_in_main // MAIN_MAP_STAY_LIMIT) 
     
-    # ¹¹½¨Õ¼ÓÃÕ¤¸ñÌØÕ÷ [seq_len, STATE_SPACE, 1]
-    feat = torch.zeros((actual_len, STATE_SPACE, 1), device=device)
-    feat.scatter_(1, poses_tensor.unsqueeze(-1), 1.0)
-    
-    return feat
+    idx = min(idx, len(sorted_map_list) - 1)
+    chosen_map, chosen_nodes = sorted_map_list[idx]
+    return chosen_map, chosen_nodes, idx
 
-def select_action(seq_features, seq_target_probs, robot_poses, current_k_val):
-    manager.train()
-    
-    # [¼Ü¹¹Ê¦ĞŞÕı] ¶ÔÆë mads_network.py µÄÇ©Ãû£º´«Èë seq_target_probs
-    # ½ÓÊÕ£º¶¯×÷logits£¬Ö¸Êı»¯»¹Ô­ºóµÄ¸ÅÂÊ£¬µ×²ã¶ÔÊı¸ÅÂÊ(ÓÃÓÚËãLoss)
-    action_logits, latest_probs, target_log_probs = manager(
-        current_k_val, seq_features, seq_target_probs, edge_index, robot_poses
-    )
-    
-    with torch.no_grad():
-        mask = global_adj_mask[robot_poses] 
-        
-    masked_logits = action_logits + (mask - 1) * 1e9
-    probs = F.softmax(masked_logits, dim=1)
-    dist = Categorical(probs)
-    actions = dist.sample()
-    
-    # ·µ»Ø·ÖÀëºóµÄ latest_probs ¸øÍâ²¿·ÅÈëÊ±Ğò´°¿Ú
-    return actions.cpu().numpy(), dist.log_prob(actions), target_log_probs, latest_probs.detach()
-
-def finish_episode(log_probs_list, rewards_list, target_loss_list):
-    R = 0
-    returns = []
-    with torch.no_grad():
-        for r in reversed(rewards_list):
-            R = r + gamma * R
-            returns.insert(0, R)
-        returns_tensor = torch.stack(returns).to(device)
-        if len(returns_tensor) > 1:
-            returns_tensor = (returns_tensor - returns_tensor.mean()) / (returns_tensor.std() + 1e-8)
-            
-    log_probs_tensor = torch.stack(log_probs_list) 
-    
-    # 1. ²ßÂÔÌİ¶ÈËğÊ§ (RL Loss)
-    rl_loss = -(log_probs_tensor * returns_tensor).sum()
-    
-    # 2. À×´ïÔ¤²â¸¨ÖúËğÊ§ (Prediction Loss)
-    pred_loss = torch.stack(target_loss_list).mean()
-    
-    # 3. »ìºÏÌİ¶È·´´«
-    total_loss = rl_loss + 0.5 * pred_loss
-    
-    optimizer.zero_grad()
-    total_loss.backward()
-    torch.nn.utils.clip_grad_norm_(manager.parameters(), max_norm=0.5)
-    optimizer.step()
-    
-    return total_loss.item(), pred_loss.item()
-
-def manualInitEmm(graph):
-    lazy_gumma = np.zeros((STATE_SPACE, STATE_SPACE), dtype=float)
-    for i in range(len(lazy_gumma)):
+# ğŸŒŸ æ³¨æ„ï¼šå¦‚æœå·²ç»åœ¨ env_multi_robot å†…é‡æ„äº†ç›®æ ‡çš„æ¸¸èµ°é€»è¾‘ï¼Œè¿™é‡Œçš„ p_stay å‚æ•°å¯é…åˆè°ƒæ•´
+def manualInitEmm(graph, current_state_space, p_stay=0.95):
+    lazy_gumma = np.zeros((current_state_space, current_state_space), dtype=float)
+    p_move = 1.0 - p_stay
+    for i in range(current_state_space):
         if i in graph:
-            size = len(graph[i])
-            for j in range(len(lazy_gumma)):
-                if i == j: lazy_gumma[i][j] = 0.9
-                elif j in graph[i]: lazy_gumma[i][j] = 0.1 / (size - 1)
-                else: lazy_gumma[i][j] = 0.
+            neighbors = [n for n in graph[i] if n != i]
+            lazy_gumma[i][i] = p_stay
+            if neighbors:
+                for j in neighbors: lazy_gumma[i][j] = p_move / len(neighbors)
+            else: lazy_gumma[i][i] = 1.0
         else:
             lazy_gumma[i][i] = 1.0
     return lazy_gumma
 
-# ==============================================================================
-# 5. Ö÷ÑµÁ·Ñ­»· (Early Fusion ¶ÓÁĞ¹ÜÀí)
-# ==============================================================================
+def get_hop_distance(graph, start, target):
+    if start == target: return 0
+    queue = deque([(start, 0)])
+    visited = {start}
+    while queue:
+        curr, dist = queue.popleft()
+        if curr == target: return dist
+        for neighbor in graph.get(curr, []):
+            if neighbor not in visited:
+                visited.add(neighbor)
+                queue.append((neighbor, dist + 1))
+    return float('inf')
+
+# ==========================================
+# 6. ä¸»è®­ç»ƒå¾ªç¯
+# ==========================================
 def main():
-    transition_prob = manualInitEmm(graph_)
-    dequelen = 30
-    recent_steps = deque(maxlen=dequelen)
-    recent_explored = deque(maxlen=dequelen)
-    recent_rewards = deque(maxlen=dequelen)
-    recent_success = deque(maxlen=dequelen)
-    recent_rl_loss = deque(maxlen=dequelen)
-    recent_pred_loss = deque(maxlen=dequelen) 
+    writer = SummaryWriter(os.path.join(log_dir_base, run_name))
+    recent_success = deque(maxlen=100)
+    recent_steps = deque(maxlen=100)
     
-    for i_episode in range(start_episode, episode_limit):
-        progress = i_episode / episode_limit
-        min_dist_threshold = max(3, int(progress * max_dist_val))
-        
-        valid_pairs = [(s, t) for s in range(STATE_SPACE) for t in range(STATE_SPACE) 
-                       if s != t and dist_matrix[s][t] >= min_dist_threshold]
-        
-        initRobotState, initTargetState = random.choice(valid_pairs) if valid_pairs else (0, 10)
-        
-        env = env_multi_robot(graph_, transition_prob, STATE_SPACE, initRobotState, initTargetState, robot_num)
-        one_hot_pose, _, _ = env.reset()
-        
-        robot_poses = [get_robot_idx(p) for p in one_hot_pose]
-        history_poses = deque([robot_poses], maxlen=seq_len)
-        visited_nodes = set(robot_poses)
-        
-        # [¼Ü¹¹Ê¦ĞŞÕı] ¹¹½¨ÓëÀúÊ·Î»ÖÃÍ¬²½µÄÄ¿±ê¸ÅÂÊ¼ÇÒä¶ÓÁĞ (Initial uniform distribution)
-        initial_probs = torch.ones(STATE_SPACE, 1, device=device) / STATE_SPACE
-        history_target_probs = deque([initial_probs], maxlen=seq_len)
-        
-        log_probs_list, rewards_list, target_loss_list = [], [], []
-        steps = 0
-        current_k = k0 
-        
-        for t in range(limit):
-            steps += 1
-            
-            explored_area = len(visited_nodes)
-            unexplored_area = max(STATE_SPACE - explored_area, 1) 
-            current_k = k0 * np.exp(-k_alpha * (explored_area / unexplored_area))
-            
-            # --- ĞòÁĞ»¯Ë«Ä£Ì¬ÌØÕ÷ ---
-            seq_feat = build_node_feature_seq(history_poses)
-            seq_target_probs_tensor = torch.stack(list(history_target_probs)) # [seq_len, N, 1]
-            
-            # --- ºËĞÄÇ°Ïò´«µİ ---
-            actions, log_p, target_log_probs, latest_probs = select_action(
-                seq_feat, seq_target_probs_tensor, robot_poses, current_k
-            )
-            
-            next_one_hot, _, rewards, next_target, done = env.step(actions)
-            
-            # [¼Ü¹¹Ê¦ĞŞÕı] ÍøÂç²àÊ¹ÓÃÁË F.log_softmax ÏŞÖÆÏÂ½ç£¬ÕâÀï¾ø¶Ô²»ÄÜÓÃ CrossEntropy£¡
-            # ±ØĞëÊ¹ÓÃ¸º¶ÔÊıËÆÈ»(NLLLoss) ½ÓÊÕÍøÂçÖ±³öµÄ log_probs Ëã½»²æìØ
-            true_target_tensor = torch.tensor([next_target], dtype=torch.long, device=device)
-            step_pred_loss = F.nll_loss(target_log_probs.unsqueeze(0), true_target_tensor)
-            target_loss_list.append(step_pred_loss)
-            
-            # --- ¸üĞÂ»·¾³ÓëË«ÖØÀúÊ·¶ÓÁĞ ---
-            robot_poses = [get_robot_idx(p) for p in next_one_hot]
-            history_poses.append(robot_poses)
-            history_target_probs.append(latest_probs.unsqueeze(-1)) # Ñ¹ÈëÔ¤²â³öµÄ×îĞÂ¸ÅÂÊÍ¼
-            visited_nodes.update(robot_poses)
-            
-            log_probs_list.append(log_p)
-            rewards_list.append(torch.tensor(rewards, device=device))
-            
-            if done: 
-                break
+    current_map_name, current_map_nodes, map_idx = get_map_sequential_v2(0, map_curriculum)
+    graph_ = graphdict_setup(current_map_name, STATE_SPACE)
+    
+    print(f"ğŸš€ å¯åŠ¨ {EPISODE_LIMIT} Episode GNNæ‹“æ‰‘æ„ŸçŸ¥è®­ç»ƒã€‚å®éªŒåç§°: {run_name}")
+    print(f"ğŸ—ºï¸ æŒ‚è½½å {MAP_COUNT} å¼ åœ°å›¾ã€‚èµ·å§‹éš¾åº¦: {map_curriculum[0][1]} èŠ‚ç‚¹, ç»ˆæéš¾åº¦: {map_curriculum[-1][1]} èŠ‚ç‚¹")
+    
+    last_map_idx = map_idx
+
+    for i_ep in range(EPISODE_LIMIT):
+        # --- è¯¾ç¨‹ä¸åœ°å›¾åˆ‡æ¢ ---
+        if i_ep > 0:
+            target_map_name, target_map_nodes, target_map_idx = get_map_sequential_v2(i_ep, map_curriculum)
+            if target_map_idx != last_map_idx:
+                current_map_name = target_map_name
+                current_map_nodes = target_map_nodes
+                graph_ = graphdict_setup(current_map_name, STATE_SPACE)
                 
-        recent_success.append(1 if done else 0) 
-        recent_steps.append(steps)
-        recent_explored.append(len(visited_nodes))
+                stay_limit = FIRST_MAP_STAY_LIMIT if target_map_idx == 1 else MAIN_MAP_STAY_LIMIT
+                print(f"ğŸŒ [åœ°å›¾åˆ‡æ¢] Ep {i_ep}: -> é”å®šç¬¬ {target_map_idx + 1}/{MAP_COUNT} å¼ åœ°å›¾: {current_map_name} (èŠ‚ç‚¹æ•°: {current_map_nodes})")
+                last_map_idx = target_map_idx
+            
+        # ç¯å¢ƒæ„å»º
+        trans_prob = manualInitEmm(graph_, STATE_SPACE, p_stay=0.95)
+        valid_nodes = list(graph_.keys())
+        adj_mask = torch.zeros((STATE_SPACE, STATE_SPACE), device=device)
+        for u in valid_nodes:
+            adj_mask[u, graph_[u]] = 1.0
         
+        # ğŸŒŸ [æ¶æ„å¸ˆçº§ä¿®å¤]ï¼šå¼ºåˆ¶ç¡®ä¿ edge_index ä¸º long ç±»å‹ï¼Œå®Œç¾åŒ¹é… GATConv éœ€æ±‚
+        edge_index = torch.tensor([[u, v] for u in graph_ for v in graph_[u]], 
+                                  dtype=torch.long, device=device).t().contiguous()
+
+        # é‡ç½®ç¯å¢ƒ
+        s_target = random.choice(valid_nodes)
+        s_robot = []
+        min_hops = min(8, max(2, len(valid_nodes) // 15)) 
+        
+        for _ in range(ROBOT_NUM):
+            candidate = random.choice(valid_nodes)
+            attempts = 0
+            while get_hop_distance(graph_, candidate, s_target) < min_hops and attempts < 100:
+                candidate = random.choice(valid_nodes)
+                attempts += 1
+            if candidate == s_target:
+                safe_nodes = [n for n in valid_nodes if n != s_target]
+                candidate = random.choice(safe_nodes) if safe_nodes else s_target
+            s_robot.append(candidate)
+            
+        env = env_multi_robot(graph_, trans_prob, STATE_SPACE, s_robot, s_target, ROBOT_NUM)
+        obs_robot, _, _ = env.reset()
+        
+        # ç»´æŠ¤ 30 æ­¥å†å²åºåˆ—
+        cur_poses = [int(np.argmax(p)) for p in obs_robot]
+        history_poses = deque([cur_poses] * SEQ_LEN, maxlen=SEQ_LEN)
+        init_prob = torch.zeros(STATE_SPACE, 1, device=device)
+        init_prob[valid_nodes] = 1.0 / len(valid_nodes)
+        history_target_probs = deque([init_prob] * SEQ_LEN, maxlen=SEQ_LEN)
+        
+        log_probs_list, rewards_list, ce_loss_list = [], [], []
+        visited = set(cur_poses)
+
+        # --- Step å¾ªç¯ ---
+        for t in range(STEP_LIMIT):
+            # åŠ¨æ€ K å€¼è®¡ç®—
+            k_val = k * np.exp(- 0.5 * (len(visited) / len(valid_nodes)))
+            
+            # æ„é€  Tensor è¾“å…¥
+            seq_feat = torch.zeros((SEQ_LEN, STATE_SPACE, 1), device=device)
+            for time_idx, step_poses in enumerate(history_poses):
+                seq_feat[time_idx, torch.tensor(step_poses).long(), 0] = 1.0
+            seq_probs = torch.stack(list(history_target_probs))
+            
+            # ğŸŒŸ å®Œç¾å¯¹é½ï¼šä¼ å…¥ edge_indexï¼Œæ¿€æ´»ç½‘ç»œå†…éƒ¨çš„ GNN æ‹“æ‰‘å¼¥æ¼«
+            logits, latest_probs, _ = manager(k_val, seq_feat, seq_probs, edge_index, cur_poses)
+            
+            # Logits æ©ç å¤„ç†ä¸åŠ¨ä½œé‡‡æ ·
+            mask = adj_mask[cur_poses]
+            probs = F.softmax(logits + (mask - 1) * 1e9, dim=1)
+            dist = Categorical(probs)
+            actions = dist.sample()
+            
+            # CE äº’æ–¥ Loss (é¼“åŠ±æ¢ç´¢ä¸åŒè·¯çº¿)
+            step_ce = 0.0
+            for i in range(ROBOT_NUM):
+                for j in range(ROBOT_NUM):
+                    if i != j:
+                        step_ce += (probs[i] * torch.log(probs[j].detach() + 1e-8)).sum()
+            ce_loss_list.append(step_ce)
+            
+            # ç¯å¢ƒäº¤äº’ (å·²æŒ‚è½½åŒ…å«æ‡’æƒ°æƒ©ç½šå’Œæ¢ç´¢å¥–åŠ±çš„æ–° Env)
+            next_obs, _, rewards, next_target, done = env.step(actions.cpu().numpy())
+            
+            # æ›´æ–°å†å²ä¸çŠ¶æ€
+            cur_poses = [int(np.argmax(p)) for p in next_obs]
+            history_poses.append(cur_poses)
+            history_target_probs.append(latest_probs.unsqueeze(-1))
+            visited.update(cur_poses)
+            
+            log_probs_list.append(dist.log_prob(actions))
+            rewards_list.append(torch.tensor(rewards, device=device, dtype=torch.float))
+            
+            if done: break
+        
+        # --- æ¢¯åº¦æ›´æ–° ---
         if len(log_probs_list) > 0:
-            total_loss_val, pred_loss_val = finish_episode(log_probs_list, rewards_list, target_loss_list)
-            total_r = sum([r.sum().item() for r in rewards_list])
+            R, returns = 0, []
+            for r in reversed(rewards_list):
+                R = r + GAMMA * R
+                returns.insert(0, R)
+            returns = torch.stack(returns)
+            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
             
-            recent_rewards.append(total_r)
-            recent_rl_loss.append(total_loss_val)
-            recent_pred_loss.append(pred_loss_val)
+            pg_loss = -(torch.stack(log_probs_list) * returns).sum()
+            a = pg_loss * BETA
             
-            writer.add_scalar('train/RL_Total_Loss', total_loss_val, i_episode)
-            writer.add_scalar('train/Radar_Pred_Loss', pred_loss_val, i_episode)
-            writer.add_scalar('train/reward', total_r, i_episode)
-            writer.add_scalar('train/steps', steps, i_episode)
-            writer.add_scalar('train/dynamic_k', current_k, i_episode)
+            if len(ce_loss_list) > 0:
+                mean_ce_over_T = torch.stack(ce_loss_list).mean() 
+                b = mean_ce_over_T * ((1.0 - BETA) / (ROBOT_NUM - 1))
+            else:
+                b = torch.tensor(0.0, device=device)
             
-            if i_episode % 10 == 0:
-                avg_steps = sum(recent_steps) / len(recent_steps)
-                avg_exp = sum(recent_explored) / len(recent_explored)
-                avg_rew = sum(recent_rewards) / len(recent_rewards)
-                avg_rl_loss = sum(recent_rl_loss) / len(recent_rl_loss)
-                avg_pred_loss = sum(recent_pred_loss) / len(recent_pred_loss)
-                success_rate = sum(recent_success) / len(recent_success) * 100
-                
-                print(f"Ep {i_episode:05d} | Win: {success_rate:3.0f}% | "
-                      f"Rwd: {avg_rew:5.1f} | Steps: {avg_steps:5.1f} | "
-                      f"Exp: {avg_exp:4.1f}/{STATE_SPACE} | "
-                      f"Loss: {avg_rl_loss:5.2f} | PredLoss: {avg_pred_loss:5.2f}")
+            total_loss = a + b
             
-            if i_episode > 0 and i_episode % 100 == 0:
-                torch.save({
-                    'episode': i_episode,
-                    'model_state_dict': manager.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                }, SAVE_MODEL_PATH)
-                print(f"--> [Model Saved] Updated Policy with Radar Head to {SAVE_MODEL_PATH}")
+            optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(manager.parameters(), 0.5)
+            optimizer.step()
+
+        # --- ç›‘æ§é¢æ¿ ---
+        recent_success.append(1 if done else 0)
+        recent_steps.append(t + 1)
+        
+        if i_ep > 0 and i_ep % 100 == 0:
+            avg_win = (sum(recent_success) / len(recent_success)) * 100
+            avg_s = sum(recent_steps) / len(recent_steps)
+            print(f"Ep {i_ep:05d} | Win: {avg_win:3.0f}% | Steps: {avg_s:5.1f} | Map: {current_map_name} | Nodes: {current_map_nodes}")
+            
+            writer.add_scalar('Train/WinRate', avg_win, i_ep)
+            writer.add_scalar('Train/AvgSteps', avg_s, i_ep)
+            writer.add_scalar('Loss/PG_Loss', a.item(), i_ep)
+            writer.add_scalar('Loss/CE_Loss', b.item(), i_ep)
+
+        # ä¿å­˜æ–­ç‚¹
+        if i_ep > 0 and i_ep % 5000 == 0:
+            save_path = os.path.join(model_save_dir, f"{run_name}.pkl")
+            torch.save(manager.state_dict(), save_path)
 
     writer.close()
+    
+    # æœ€ç»ˆæ¨¡å‹ä¿å­˜
+    final_save_path = os.path.join(model_save_dir, f"{run_name}.pkl")
+    torch.save(manager.state_dict(), final_save_path)
+    print(f"âœ… è®­ç»ƒåœ†æ»¡å®Œæˆã€‚æœ€ç»ˆæ¨¡å‹å·²ä¿å­˜è‡³: {final_save_path}")
 
 if __name__ == '__main__':
     main()
